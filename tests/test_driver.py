@@ -1,7 +1,11 @@
 """
-Unit tests for driver coordinate helpers and jog delta math.
+Unit tests for driver position tracking and coordinate helpers.
 
-These tests import only from bjjcz.coord so they run without Rayforge.
+These tests use only bjjcz.coord (no Rayforge / lcs_api dependency) so they
+run without hardware or LightBurn installed.
+
+BJJCZDriver.jog() accumulates deltas in mm and applies flip_y before calling
+lcs_api.goto(x, -y).  The math is verified here independently.
 """
 
 import pytest
@@ -10,7 +14,7 @@ from bjjcz.coord import GALVO_CENTER, mm_to_galvo
 
 
 class TestCoordHelper:
-    """Verify the coordinate helper used by BJJCZDriver._to_galvo()."""
+    """Verify the coordinate helper used for legacy galvo-unit callers."""
 
     def test_center(self):
         gx, gy = mm_to_galvo(0.0, 0.0, 500.0, True)
@@ -29,31 +33,51 @@ class TestCoordHelper:
 
 
 class TestJogDeltaMath:
-    """Verify the jog delta calculation mirrors BJJCZDriver.jog()."""
+    """
+    Verify the jog delta calculation that BJJCZDriver.jog() uses.
 
-    def _calc_jog(self, last_x, last_y, dx_mm, dy_mm, galvos_per_mm=500, flip_y=True):
-        new_gx = int(last_x + dx_mm * galvos_per_mm)
-        new_gy = int(last_y + (-dy_mm if flip_y else dy_mm) * galvos_per_mm)
-        return new_gx, new_gy
+    Driver tracks (pos_x, pos_y) in Rayforge mm space (before flip_y).
+    The call to lcs_api.goto receives (pos_x, -pos_y) when flip_y=True.
+    """
+
+    @staticmethod
+    def _apply_jog(pos_x, pos_y, dx, dy):
+        """Simulate one driver.jog() call: returns new (pos_x, pos_y) in Rayforge space."""
+        return pos_x + dx, pos_y + dy
+
+    @staticmethod
+    def _to_lcs(pos_x, pos_y, flip_y=True):
+        """Apply flip before sending to lcs_api.goto()."""
+        return pos_x, (-pos_y if flip_y else pos_y)
 
     def test_jog_right_1mm(self):
-        gx, gy = self._calc_jog(GALVO_CENTER, GALVO_CENTER, 1.0, 0.0)
-        assert gx == GALVO_CENTER + 500
-        assert gy == GALVO_CENTER
+        px, py = self._apply_jog(0.0, 0.0, 1.0, 0.0)
+        assert px == 1.0
+        assert py == 0.0
+        lx, ly = self._to_lcs(px, py)
+        assert lx == 1.0
+        assert ly == 0.0
 
-    def test_jog_up_1mm_flipped(self):
-        gx, gy = self._calc_jog(GALVO_CENTER, GALVO_CENTER, 0.0, 1.0)
-        assert gx == GALVO_CENTER
-        assert gy == GALVO_CENTER - 500
+    def test_jog_up_1mm_flip_y(self):
+        px, py = self._apply_jog(0.0, 0.0, 0.0, 1.0)
+        assert px == 0.0
+        assert py == 1.0
+        lx, ly = self._to_lcs(px, py, flip_y=True)
+        assert lx == 0.0
+        assert ly == -1.0   # Y flipped when sent to hardware
 
     def test_jog_diagonal(self):
-        gx, gy = self._calc_jog(GALVO_CENTER, GALVO_CENTER, 2.0, 3.0)
-        assert gx == GALVO_CENTER + 1000
-        assert gy == GALVO_CENTER - 1500
+        px, py = self._apply_jog(0.0, 0.0, 2.0, 3.0)
+        lx, ly = self._to_lcs(px, py)
+        assert lx == 2.0
+        assert ly == -3.0
 
-    def test_jog_from_non_center(self):
-        start_x = GALVO_CENTER + 1000  # already 2mm right
-        start_y = GALVO_CENTER
-        gx, gy = self._calc_jog(start_x, start_y, 1.0, 0.0)
-        assert gx == GALVO_CENTER + 1500
-        assert gy == GALVO_CENTER
+    def test_jog_from_non_origin(self):
+        px, py = self._apply_jog(5.0, -2.0, 1.0, 0.0)
+        assert px == 6.0
+        assert py == -2.0
+
+    def test_no_flip_y(self):
+        px, py = self._apply_jog(0.0, 0.0, 0.0, 4.0)
+        lx, ly = self._to_lcs(px, py, flip_y=False)
+        assert ly == 4.0    # no flip

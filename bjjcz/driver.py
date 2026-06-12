@@ -1,13 +1,11 @@
 """
 BJJCZDriver — Rayforge driver for BJJCZ/JCZ LMC galvo controllers.
 
-Wraps galvoplotter.GalvoController (threading model) inside Rayforge's
-async Driver interface using asyncio.to_thread() for all blocking calls.
+Uses liblcs2dll.so (shipped with LightBurn) via ctypes.  All blocking calls
+are offloaded to a thread pool with asyncio.to_thread().
 
-Supports any LMC-protocol galvo controller reachable over USB.
-Common USB IDs:
-  - 0x9588:0x9899 — standard BJJCZ LMC controller
-  - 0x04b4:0x1004 — SEA-LASER (Cypress FX2 USB bridge, same LMC protocol)
+Coordinate convention: mm, origin at field centre.  flip_y negates the
+Y axis so Rayforge's "up" matches the physical beam direction.
 """
 
 from __future__ import annotations
@@ -40,58 +38,17 @@ if TYPE_CHECKING:
     from rayforge.machine.models.machine import Machine
     from rayforge.pipeline.encoder.base import EncodedOutput, OpsEncoder
 
-from .coord import GALVO_CENTER, mm_to_galvo
+from . import lcs_api
 
 logger = logging.getLogger(__name__)
-
-
-class _SEALaserController:
-    """
-    Mixin that replaces the two galvoplotter methods that poll the READY bit.
-
-    USB-Lite firmware (e.g. SEA-LASER / SEATHINKING) only toggles the BUSY
-    bit (0x04) during list execution.  The READY bit (0x20) is never set, so
-    galvoplotter's wait_ready() and wait_finished() loop forever.
-
-    LightBurn's WaitForCompletion exits when BUSY=0 — the same logic as the
-    wait_finished() override here.  wait_ready() simply returns immediately
-    because the USB-Lite device is always ready to receive list data.
-    """
-
-    def wait_ready(self):
-        return  # READY bit never set; device is always ready
-
-    def wait_finished(self):
-        import time as _t
-        t_settle = _t.monotonic() + 0.1
-        while _t.monotonic() < t_settle and not self.is_busy():
-            _t.sleep(0.005)
-        t_end = _t.monotonic() + 600.0
-        while self.is_busy() and _t.monotonic() < t_end:
-            _t.sleep(0.01)
-            if not self._sending:
-                return
-
-
-# Galvo command → GalvoController method mapping used in run()
-_CMD_METHOD: Dict[str, str] = {
-    "goto": "goto",
-    "mark": "mark",
-    "power": "set_power",
-    "mark_speed": "set_mark_speed",
-    "travel_speed": "set_travel_speed",
-    "frequency": "set_frequency",
-    "pulse_width": "set_pulse_width",
-}
 
 
 class BJJCZDriver(Driver):
     """
     Driver for BJJCZ/JCZ LMC galvo laser controllers.
 
-    Uses the galvoplotter library for low-level USB communication.
-    The controller runs in a background thread; asyncio.to_thread()
-    bridges every blocking call into Rayforge's async event loop.
+    Requires liblcs2dll.so from LightBurn in the path defined by LCS_LIB_PATH
+    (default: ~/.local/share/LightBurn/lib/).
     """
 
     label = _("BJJCZ Galvo (USB)")
@@ -103,9 +60,13 @@ class BJJCZDriver(Driver):
 
     def __init__(self, context: RayforgeContext, machine: "Machine"):
         super().__init__(context, machine)
-        self._controller = None
-        self._galvos_per_mm: float = 500.0
         self._flip_y: bool = True
+        self._mark_speed: float = 500.0
+        self._jump_speed: float = 2000.0
+        self._power_pct: float = 20.0
+        self._pos_x: float = 0.0   # current position in mm
+        self._pos_y: float = 0.0
+        self._ready: bool = False
         self._connection_task: Optional[asyncio.Task] = None
         self._keep_running: bool = False
 
@@ -131,112 +92,35 @@ class BJJCZDriver(Driver):
 
     @classmethod
     def precheck(cls, **kwargs: Any) -> None:
-        galvos = kwargs.get("galvos_per_mm", 500)
-        if not isinstance(galvos, (int, float)) or galvos <= 0:
-            raise DriverPrecheckError(_("galvos_per_mm must be a positive number."))
+        pass
 
     @classmethod
     def get_setup_vars(cls) -> "VarSet":
-        return VarSet(
-            vars=[
-                IntVar(
-                    key="usb_vendor_id",
-                    label=_("USB Vendor ID"),
-                    description=_(
-                        "USB vendor ID in decimal. "
-                        "0x9588 (38280) = standard BJJCZ LMC; "
-                        "0x04b4 (1204) = Cypress/SEA-LASER."
-                    ),
-                    default=1204,  # 0x04b4 — Cypress / SEA-LASER
-                ),
-                IntVar(
-                    key="usb_product_id",
-                    label=_("USB Product ID"),
-                    description=_(
-                        "USB product ID in decimal. "
-                        "0x9899 (39065) = standard BJJCZ LMC; "
-                        "0x1004 (4100) = SEA-LASER."
-                    ),
-                    default=4100,  # 0x1004 — SEA-LASER
-                ),
-                IntVar(
-                    key="galvos_per_mm",
-                    label=_("Galvos per mm"),
-                    description=_(
-                        "Scale factor: galvo units per millimetre. "
-                        "Adjust to match your correction file calibration. "
-                        "Default 500 suits most BJJCZ systems."
-                    ),
-                    default=500,
-                ),
-                IntVar(
-                    key="machine_index",
-                    label=_("USB device index"),
-                    description=_(
-                        "Index of the USB controller when multiple devices "
-                        "are connected. Usually 0."
-                    ),
-                    default=0,
-                ),
-                IntVar(
-                    key="read_endpoint",
-                    label=_("USB read endpoint"),
-                    description=_(
-                        "USB bulk-in endpoint address. "
-                        "0x84 (132) = SEA-LASER/Cypress FX2; "
-                        "0x88 (136) = standard BJJCZ LMC."
-                    ),
-                    default=132,  # 0x84 — SEA-LASER
-                ),
-            ]
-        )
+        return VarSet(vars=[
+            IntVar(
+                key="mark_speed",
+                label=_("Mark speed (mm/s)"),
+                description=_("Default laser marking speed in mm/s."),
+                default=500,
+            ),
+            IntVar(
+                key="jump_speed",
+                label=_("Jump speed (mm/s)"),
+                description=_("Default mirror travel speed (no laser) in mm/s."),
+                default=2000,
+            ),
+        ])
 
     def _setup_implementation(self, **kwargs: Any) -> None:
-        from galvo.controller import GalvoController
-
-        from .usb import ConfigurableUSBConnection
-
         driver_args = self._machine.driver_args or {}
-        source = driver_args.get("source", "fiber")
-        self._galvos_per_mm = float(
-            driver_args.get("galvos_per_mm", kwargs.get("galvos_per_mm", 500))
-        )
-        self._flip_y = bool(driver_args.get("flip_y", True))
-        machine_index = int(kwargs.get("machine_index", driver_args.get("machine_index", 0)))
-
-        # USB IDs: prefer setup-var value, fall back to driver_args, then defaults.
-        # Stored as decimal in VarSet; device.yaml hex strings are parsed by int().
-        vendor_id = int(
-            kwargs.get("usb_vendor_id", driver_args.get("usb_vendor_id", 0x04B4))
-        )
-        product_id = int(
-            kwargs.get("usb_product_id", driver_args.get("usb_product_id", 0x1004))
-        )
-        read_endpoint = int(
-            kwargs.get("read_endpoint", driver_args.get("read_endpoint", 0x84))
-        )
-
+        self._flip_y     = bool(driver_args.get("flip_y", True))
+        self._mark_speed = float(driver_args.get("mark_speed",
+                                 kwargs.get("mark_speed", 500)))
+        self._jump_speed = float(driver_args.get("jump_speed",
+                                 kwargs.get("jump_speed", 2000)))
         try:
-            # Build a one-off subclass that patches out the READY-bit waits.
-            SEAController = type(
-                "SEAController",
-                (_SEALaserController, GalvoController),
-                {},
-            )
-            self._controller = SEAController(
-                galvos_per_mm=int(self._galvos_per_mm),
-                machine_index=machine_index,
-            )
-            self._controller.source = source
-            # Inject our configurable connection so galvoplotter doesn't
-            # create its hardcoded USBConnection(0x9588:0x9899).
-            self._controller.connection = ConfigurableUSBConnection(
-                vendor_id=vendor_id,
-                product_id=product_id,
-                read_endpoint=read_endpoint,
-                channel=self._controller.usb_log,
-            )
-        except Exception as exc:
+            lcs_api.load()
+        except FileNotFoundError as exc:
             raise DriverSetupError(str(exc)) from exc
 
     # ------------------------------------------------------------------
@@ -244,9 +128,6 @@ class BJJCZDriver(Driver):
     # ------------------------------------------------------------------
 
     async def _connect_implementation(self) -> None:
-        if not self._controller:
-            self._emit_transport(TransportStatus.DISCONNECTED, "Not configured")
-            return
         if self._connection_task and not self._connection_task.done():
             return
         self._keep_running = True
@@ -256,26 +137,26 @@ class BJJCZDriver(Driver):
         while self._keep_running:
             self._emit_transport(TransportStatus.CONNECTING)
             try:
-                await asyncio.to_thread(self._controller.connect_if_needed)
+                await asyncio.to_thread(lcs_api.init)
+                self._ready = True
                 self._emit_transport(TransportStatus.CONNECTED)
                 self.state.status = DeviceStatus.IDLE
                 self.state_changed.send(self, state=self.state)
-                logger.info("BJJCZ controller connected", extra=self._log_extra("MACHINE_EVENT"))
+                logger.info("BJJCZ controller connected")
 
-                # Poll connection health every 2 s
-                while self._keep_running and self._controller.is_connected:
+                while self._keep_running:
                     await asyncio.sleep(2.0)
-                    self._sync_state()
-
-                if self._keep_running:
-                    logger.warning("BJJCZ controller lost connection, retrying")
-                    self._emit_transport(TransportStatus.SLEEPING)
-                    await asyncio.sleep(5.0)
+                    # Light health check: get_status() returns 0 when idle
+                    try:
+                        lcs_api.get_status()
+                    except Exception:
+                        break
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.error("BJJCZ connection error: %s", exc)
+                self._ready = False
                 self.state.error = DeviceError(-1, str(exc), _("Connection failed"))
                 self._emit_transport(TransportStatus.ERROR, str(exc))
                 if self._keep_running:
@@ -291,9 +172,12 @@ class BJJCZDriver(Driver):
             except asyncio.CancelledError:
                 pass
             self._connection_task = None
-        if self._controller and self._controller.is_connected:
-            await asyncio.to_thread(self._controller.disconnect)
-        self._controller = None
+        if self._ready:
+            try:
+                await asyncio.to_thread(lcs_api.free)
+            except Exception:
+                pass
+            self._ready = False
         self._emit_transport(TransportStatus.DISCONNECTED)
         await super().cleanup()
 
@@ -303,6 +187,7 @@ class BJJCZDriver(Driver):
 
     @classmethod
     def create_encoder(cls, machine: "Machine") -> "OpsEncoder":
+        from .encoder import BJJCZEncoder
         return BJJCZEncoder()
 
     async def run(
@@ -312,25 +197,42 @@ class BJJCZDriver(Driver):
         ops: "Ops",
         on_command_done: Optional[Callable[[int], Union[None, Awaitable[None]]]] = None,
     ) -> None:
-        assert self._controller, "Controller not initialised"
+        assert self._ready, "Controller not connected"
         commands = encoded.driver_data.get("commands", [])
 
-        def _job(c) -> bool:
+        mark_speed = self._mark_speed
+        jump_speed = self._jump_speed
+
+        def _execute() -> None:
+            lcs_api.set_mark_speed(mark_speed)
+            lcs_api.set_jump_speed(jump_speed)
+            lcs_api.list_start()
+
             for entry in commands:
                 cmd, *args = entry
-                method_name = _CMD_METHOD.get(cmd)
-                if method_name:
-                    getattr(c, method_name)(*args)
+                if cmd == "goto":
+                    lcs_api.list_jump(args[0], args[1])
+                elif cmd == "mark":
+                    lcs_api.list_mark(args[0], args[1])
+                elif cmd == "mark_speed":
+                    lcs_api.set_mark_speed(float(args[0]))
+                elif cmd == "travel_speed":
+                    lcs_api.set_jump_speed(float(args[0]))
+                elif cmd == "power":
+                    lcs_api.set_power(float(args[0]))
+                elif cmd == "frequency":
+                    pass  # TODO: n_set_laser_pulses inside list
+                elif cmd == "pulse_width":
+                    pass  # TODO: n_set_laser_pulses inside list
                 else:
-                    logger.debug("BJJCZ: unknown command %s", cmd)
-            return True
+                    logger.debug("BJJCZ: unhandled command %s", cmd)
+
+            lcs_api.list_end()  # sends + waits
 
         self.state.status = DeviceStatus.RUN
         self.state_changed.send(self, state=self.state)
         try:
-            with self._controller.marking() as ctx:
-                await asyncio.to_thread(_job, ctx)
-            await asyncio.to_thread(self._controller.wait_finished)
+            await asyncio.to_thread(_execute)
         finally:
             self.state.status = DeviceStatus.IDLE
             self.state_changed.send(self, state=self.state)
@@ -345,44 +247,46 @@ class BJJCZDriver(Driver):
     # Motion
     # ------------------------------------------------------------------
 
-    async def move_to(self, pos_x: float, pos_y: float) -> None:
-        assert self._controller
-        gx, gy = self._to_galvo(pos_x, pos_y)
-        await asyncio.to_thread(self._controller.jog, gx, gy)
+    def _apply_flip(self, x_mm: float, y_mm: float) -> Tuple[float, float]:
+        return x_mm, (-y_mm if self._flip_y else y_mm)
 
-    def can_home(self, axis: Optional[Axis] = None) -> bool:
+    async def move_to(self, pos_x: float, pos_y: float) -> None:
+        assert self._ready
+        x, y = self._apply_flip(pos_x, pos_y)
+        await asyncio.to_thread(lcs_api.goto, x, y)
+        self._pos_x, self._pos_y = pos_x, pos_y
+
+    def can_home(self, axis=None) -> bool:
         return True
 
-    async def home(self, axes: Optional[Axis] = None) -> None:
-        assert self._controller
-        await asyncio.to_thread(self._controller.jog, GALVO_CENTER, GALVO_CENTER)
+    async def home(self, axes=None) -> None:
+        assert self._ready
+        await asyncio.to_thread(lcs_api.goto, 0.0, 0.0)
+        self._pos_x, self._pos_y = 0.0, 0.0
 
-    def can_jog(self, axis: Optional[Axis] = None) -> bool:
+    def can_jog(self, axis=None) -> bool:
         return True
 
     async def jog(self, speed: int, **deltas: float) -> None:
-        assert self._controller
-        last_x, last_y = self._controller.get_last_xy()
-        dx_mm = deltas.get("x", 0.0)
-        dy_mm = deltas.get("y", 0.0)
-        new_gx = int(last_x + dx_mm * self._galvos_per_mm)
-        new_gy = int(last_y + (-dy_mm if self._flip_y else dy_mm) * self._galvos_per_mm)
-        await asyncio.to_thread(self._controller.jog, new_gx, new_gy)
+        assert self._ready
+        new_x = self._pos_x + deltas.get("x", 0.0)
+        new_y = self._pos_y + deltas.get("y", 0.0)
+        await self.move_to(new_x, new_y)
 
     # ------------------------------------------------------------------
     # Hold / cancel
     # ------------------------------------------------------------------
 
     async def set_hold(self, hold: bool = True) -> None:
-        assert self._controller
+        if not self._ready:
+            return
         if hold:
-            await asyncio.to_thread(self._controller.pause)
-        else:
-            await asyncio.to_thread(self._controller.resume)
+            await asyncio.to_thread(lcs_api.stop)
 
     async def cancel(self) -> None:
-        assert self._controller
-        await asyncio.to_thread(self._controller.abort)
+        if not self._ready:
+            return
+        await asyncio.to_thread(lcs_api.stop)
         self.state.status = DeviceStatus.IDLE
         self.state_changed.send(self, state=self.state)
 
@@ -391,14 +295,15 @@ class BJJCZDriver(Driver):
     # ------------------------------------------------------------------
 
     async def set_power(self, head: "Laser", percent: float) -> None:
-        assert self._controller
-        await asyncio.to_thread(self._controller.set_power, percent * 100.0)
+        if not self._ready:
+            return
+        await asyncio.to_thread(lcs_api.set_power, percent * 100.0)
 
     async def set_focus_power(self, head: "Laser", percent: float) -> None:
         await self.set_power(head, percent)
 
     # ------------------------------------------------------------------
-    # Settings (stubs — LMC config is handled via correction files)
+    # Settings (stubs)
     # ------------------------------------------------------------------
 
     def get_setting_vars(self) -> List["VarSet"]:
@@ -415,7 +320,7 @@ class BJJCZDriver(Driver):
         pass
 
     # ------------------------------------------------------------------
-    # Tool / WCS stubs (not applicable to galvo)
+    # Tool / WCS stubs
     # ------------------------------------------------------------------
 
     async def select_tool(self, tool_number: int) -> None:
@@ -429,34 +334,12 @@ class BJJCZDriver(Driver):
         self.wcs_updated.send(self, offsets=offsets)
         return offsets
 
-    async def run_probe_cycle(
-        self, axis: Axis, max_travel: float, feed_rate: int
-    ) -> Optional[Pos]:
+    async def run_probe_cycle(self, axis, max_travel: float, feed_rate: int) -> Optional[Pos]:
         return None
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _to_galvo(self, x_mm: float, y_mm: float) -> Tuple[int, int]:
-        return mm_to_galvo(x_mm, y_mm, self._galvos_per_mm, self._flip_y)
-
-    def _sync_state(self) -> None:
-        if not self._controller:
-            return
-        raw = self._controller.state
-        if raw is None:
-            return
-        status_str, _ = raw
-        mapping = {
-            "idle": DeviceStatus.IDLE,
-            "busy": DeviceStatus.RUN,
-            "hold": DeviceStatus.HOLD,
-        }
-        new_status = mapping.get(status_str, DeviceStatus.UNKNOWN)
-        if new_status != self.state.status:
-            self.state.status = new_status
-            self.state_changed.send(self, state=self.state)
 
     def _emit_transport(self, status: "TransportStatus", message: str = "") -> None:
         self.connection_status_changed.send(self, status=status, message=message)
