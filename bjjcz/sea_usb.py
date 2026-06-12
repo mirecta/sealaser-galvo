@@ -66,55 +66,32 @@ _DEFAULT_MARK_SPEED  = 500    # mm/s
 # Responses are read-and-discarded; their content is device-specific calibration
 # data that we currently do not need to parse.
 
-_INIT_FRAMES: list[bytes] = [
-    # 1. Firmware-version probe  (raw 12 bytes, no FE FF header)
-    bytes.fromhex("012300000000000000000000"),
-    # 2. Status query  (ff f1)
-    bytes.fromhex("feff00148000fff10000000000000000000000f0"),
-    # 3. HW info query  (f0 f0) — 60-byte response
-    bytes.fromhex("feff00148000f0f00000000000000000000000e0"),
-    # 4–15. Config / calibration reads  (ff fb sub-commands)
-    bytes.fromhex("feff00188000fffb010900000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb011100000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb011000000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb011000000000000000000000000000fa"),  # repeated
-    bytes.fromhex("feff00188000fffb010900000000000000000000000000fa"),  # repeated
-    bytes.fromhex("feff00188000fffb010100000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb010200000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb010300000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb010400000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb010500000000000000000000000000fa"),
-    bytes.fromhex("feff00188000fffb011100000000000000000000000000fa"),  # repeated
-    bytes.fromhex("feff00188000fffb010600000000000000000000000000fa"),
-    # 16. Enter ready state
-    bytes.fromhex("feff00148000aa100001000000000000000000ba"),
-    bytes.fromhex("feff00148000aa340000000000000000000000de"),
-    bytes.fromhex("feff00148000aa050000000000000000000000af"),  # status → 01 (IDLE)
-    bytes.fromhex("feff00148000aa100003000000000000000000ba"),  # activate goto mode
+_PROBE = bytes.fromhex("012300000000000000000000")  # 12-byte firmware probe
+
+# Init frames sent AFTER the probe handshake (each expects one response).
+_INIT_FRAMES: list[tuple[bytes, int]] = [
+    # (TX frame,                                                               expected RX size)
+    (bytes.fromhex("feff00148000fff10000000000000000000000f0"),  20),  # status query
+    (bytes.fromhex("feff00148000f0f00000000000000000000000e0"),  60),  # hw info (60-byte resp)
+    (bytes.fromhex("feff00188000fffb010900000000000000000000000000fa"), 20),  # ff fb 09
+    (bytes.fromhex("feff00188000fffb011100000000000000000000000000fa"), 28),  # ff fb 11
+    (bytes.fromhex("feff00188000fffb011000000000000000000000000000fa"), 20),  # ff fb 10
+    (bytes.fromhex("feff00188000fffb011000000000000000000000000000fa"), 20),  # ff fb 10 (repeat)
+    (bytes.fromhex("feff00188000fffb010900000000000000000000000000fa"), 20),  # ff fb 09 (repeat)
+    (bytes.fromhex("feff00188000fffb010100000000000000000000000000fa"), 24),  # ff fb 01
+    (bytes.fromhex("feff00188000fffb010200000000000000000000000000fa"), 24),  # ff fb 02
+    (bytes.fromhex("feff00188000fffb010300000000000000000000000000fa"), 24),  # ff fb 03
+    (bytes.fromhex("feff00188000fffb010400000000000000000000000000fa"), 24),  # ff fb 04
+    (bytes.fromhex("feff00188000fffb010500000000000000000000000000fa"), 24),  # ff fb 05
+    (bytes.fromhex("feff00188000fffb011100000000000000000000000000fa"), 28),  # ff fb 11 (repeat)
+    (bytes.fromhex("feff00188000fffb010600000000000000000000000000fa"), 24),  # ff fb 06
+    (bytes.fromhex("feff00148000aa100001000000000000000000ba"),           20),  # aa 10 sub=01
+    (bytes.fromhex("feff00148000aa340000000000000000000000de"),           20),  # aa 34
+    (bytes.fromhex("feff00148000aa050000000000000000000000af"),           40),  # aa 05 → status 01
 ]
 
-# Expected response lengths for each init frame (for reads)
-_INIT_RESP_SIZES: list[int] = [
-    20,   # 1  fw version
-    20,   # 2  status
-    60,   # 3  hw info
-    20,   # 4  ff fb 09
-    28,   # 5  ff fb 11
-    20,   # 6  ff fb 10
-    20,   # 7  ff fb 10 (repeat)
-    20,   # 8  ff fb 09 (repeat)
-    24,   # 9  ff fb 01
-    24,   # 10 ff fb 02
-    24,   # 11 ff fb 03
-    24,   # 12 ff fb 04
-    24,   # 13 ff fb 05
-    28,   # 14 ff fb 11 (repeat)
-    24,   # 15 ff fb 06
-    20,   # 16 aa 10 sub=01
-    20,   # 17 aa 34
-    40,   # 18 aa 05 (status)
-    20,   # 19 aa 10 sub=03
-]
+# Sent once before the very first goto_xy call to activate motion mode.
+_ACTIVATE_GOTO = bytes.fromhex("feff00148000aa100003000000000000000000ba")
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +128,7 @@ class SEALaserUSB:
         self._seq: int = 0
         self._pos_x_galvo: int = GALVO_CENTER
         self._pos_y_galvo: int = GALVO_CENTER
+        self._goto_activated: bool = False   # True after first aa10-sub03 sent
         self._dev: Optional[usb.core.Device] = None
 
     # ------------------------------------------------------------------
@@ -189,29 +167,60 @@ class SEALaserUSB:
     # ------------------------------------------------------------------
 
     def init(self) -> None:
-        """Run the firmware init sequence and activate goto mode."""
+        """Run the firmware init sequence."""
         dev = self._require()
-        for frame, resp_size in zip(_INIT_FRAMES, _INIT_RESP_SIZES):
+
+        # Probe: device ignores the first attempt; send it twice.
+        # First TX has no response — use a short timeout and swallow the error.
+        try:
+            dev.write(EP_CMD, _PROBE, timeout=200)
+            dev.read(EP_RESP, 20, timeout=200)
+        except usb.core.USBError:
+            pass
+        time.sleep(0.1)
+        dev.write(EP_CMD, _PROBE, timeout=TIMEOUT_MS)
+        dev.read(EP_RESP, 20, timeout=TIMEOUT_MS)
+
+        # Main init sequence
+        for frame, resp_size in _INIT_FRAMES:
             dev.write(EP_CMD, frame, timeout=TIMEOUT_MS)
             dev.read(EP_RESP, resp_size, timeout=TIMEOUT_MS)
+
+        self._goto_activated = False
 
     # ------------------------------------------------------------------
     # Direct motion
     # ------------------------------------------------------------------
 
+    _STATUS_CMD = bytes.fromhex("feff00148000aa050000000000000000000000af")
+
     def goto_xy(self, x_mm: float, y_mm: float) -> None:
         """Move mirrors to (x_mm, y_mm) with no laser.  Blocking."""
         dev = self._require()
-        self._seq += 1
 
+        # Activate motion mode on the first goto call
+        if not self._goto_activated:
+            dev.write(EP_CMD, _ACTIVATE_GOTO, timeout=TIMEOUT_MS)
+            dev.read(EP_RESP, 20, timeout=TIMEOUT_MS)
+            self._goto_activated = True
+
+        # Status poll required before every EP 0x02 command
+        dev.write(EP_CMD, self._STATUS_CMD, timeout=TIMEOUT_MS)
+        dev.read(EP_RESP, 40, timeout=TIMEOUT_MS)
+
+        self._seq += 1
         x_g = self._mm_to_galvo(x_mm)
         y_g = self._mm_to_galvo(y_mm)
-
         vspeed = self._vector_speed(x_g, y_g)
 
         frame = self._build_goto(self._seq, vspeed, self._mark_speed, x_g, y_g)
         dev.write(EP_POS, frame, timeout=TIMEOUT_MS)
-        dev.read(EP_ACK, 20, timeout=TIMEOUT_MS)
+        # EP 0x84 ack: device only responds if an IN token was pending before the write.
+        # liblcs2dll uses async libusb so it pre-submits the read; we skip it here.
+        try:
+            dev.read(EP_ACK, 20, timeout=50)
+        except usb.core.USBError:
+            pass
 
         self._pos_x_galvo = x_g
         self._pos_y_galvo = y_g
