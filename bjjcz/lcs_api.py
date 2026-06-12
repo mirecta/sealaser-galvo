@@ -89,10 +89,17 @@ def _bind(lib: ctypes.CDLL) -> None:
     _fn(lib, "disable_laser",          u32, [u32])
 
     # Laser parameters (immediate)
+    # Signatures verified from C++ mangled exports:
+    #   setLaserMode(j,j,b)  setLaserPower(j,h)  setLaserPulses(j,j,j,t)
+    #   setLaserDelays(j,l,j)  setLaserControl(j,b)
+    u8  = ctypes.c_uint8
+    u16 = ctypes.c_uint16
+    lng = ctypes.c_long
     _fn(lib, "set_laser_mode",         u32, [u32, u32, boo])   # card, mode, pulsed
-    _fn(lib, "set_laser_power",        u32, [u32, u32])         # card, power 0-100
-    _fn(lib, "set_laser_pulses",       u32, [u32, u32, u32])   # card, freq_hz, pulse_us
-    _fn(lib, "set_laser_delays",       u32, [u32, u32, u32])   # card, on_us, off_us
+    _fn(lib, "set_laser_control",      u32, [u32, boo])         # card, enable — fiber MO
+    _fn(lib, "set_laser_power",        u32, [u32, u8])          # card, power 0-100 (u8!)
+    _fn(lib, "set_laser_pulses",       u32, [u32, u32, u32, u16])  # card, freq_hz, pulse_us, flags
+    _fn(lib, "set_laser_delays",       u32, [u32, lng, u32])    # card, on_us (long!), off_us
     _fn(lib, "set_scanner_delays",     u32, [u32, u32, u32, u32])  # card, jump, mark, poly
 
     # Speed (immediate, effective for the next list execution)
@@ -114,10 +121,27 @@ def _bind(lib: ctypes.CDLL) -> None:
     _fn(lib, "n_laser_on_list",        u32, [u32, u32])         # card, time_us
     _fn(lib, "laser_on_list",          u32, [u32, u32])
 
+    # First Pulse Killer — ENFPK=1, FPK=40 in OEM config
+    _fn(lib, "set_firstpulse_killer",       u32, [u32, u32])    # card, fpk_us
+    _fn(lib, "set_firstpulse_killer_list",  u32, [u32, u32])    # immediate list-mode
+    _fn(lib, "n_set_firstpulse_killer",     u32, [u32, u32])
+    _fn(lib, "n_set_firstpulse_killer_list",u32, [u32, u32])    # in-list FPK
+
+    # Standby — warm-up delays for fiber laser source
+    _fn(lib, "set_standby",       u32, [u32, u32, u32])         # card, standby1, standby2
+    _fn(lib, "set_standby_list",  u32, [u32, u32, u32])
+    _fn(lib, "n_set_standby",     u32, [u32, u32, u32])
+    _fn(lib, "n_set_standby_list",u32, [u32, u32, u32])         # in-list standby
+
     # In-list parameter overrides
     _fn(lib, "n_set_mark_speed",       u32, [u32, dbl])
     _fn(lib, "n_set_jump_speed",       u32, [u32, dbl])
-    _fn(lib, "n_set_laser_power",      u32, [u32, u32])
+    _fn(lib, "n_set_laser_mode",       u32, [u32, u32, boo])   # card, mode, pulsed
+    _fn(lib, "n_set_laser_control",    u32, [u32, boo])         # card, enable — fiber MO
+    _fn(lib, "n_set_laser_power",      u32, [u32, u8])          # card, power (u8!)
+    _fn(lib, "n_set_laser_pulses",     u32, [u32, u32, u32, u16])  # card, freq_hz, pulse_us, flags
+    _fn(lib, "n_set_laser_delays",     u32, [u32, lng, u32])    # card, on_us (long!), off_us
+    _fn(lib, "n_set_scanner_delays",   u32, [u32, u32, u32, u32])  # card, jump, mark, poly
 
     # List execution / control
     _fn(lib, "execute_list_1",         u32, [u32])
@@ -254,7 +278,9 @@ def list_start() -> None:
 def list_end() -> None:
     """Finalise and execute list 1, then block until marking completes."""
     _check(_l().n_set_end_of_list(CARD), "n_set_end_of_list")
-    _check(_l().execute_list_1(CARD), "execute_list_1")
+    # execute_list_1 has an off-by-one bug in liblcs2dll.so — n_execute_list_2
+    # correctly executes list-buffer 0 (started with n_set_start_list_1).
+    _check(_l().n_execute_list_2(CARD), "n_execute_list_2")
     wait_finished()
 
 
@@ -292,15 +318,17 @@ def marking(mark_speed_mm_s: float = 500.0, jump_speed_mm_s: float = 2000.0):
     On exit the list is sent to hardware and we wait for completion.
     On exception the list is aborted.
     """
-    set_mark_speed(mark_speed_mm_s)
-    set_jump_speed(jump_speed_mm_s)
     list_start()
+    # Speeds must be set INSIDE the list (set_mark_speed adds to the
+    # current list buffer; calling it before list_start fails silently).
+    _check(_l().n_set_mark_speed(CARD, float(mark_speed_mm_s)), "n_set_mark_speed")
+    _check(_l().n_set_jump_speed(CARD, float(jump_speed_mm_s)), "n_set_jump_speed")
 
     class _Ctx:
         def jump(self, x, y):       list_jump(x, y)
         def mark(self, x, y):       list_mark(x, y)
         def laser_on(self, us):     list_laser_on(us)
-        def speed(self, mm_s):      set_mark_speed(mm_s)
+        def speed(self, mm_s):      _check(_l().n_set_mark_speed(CARD, float(mm_s)), "n_set_mark_speed")
         def power(self, pct):       set_power(pct)
 
     ctx = _Ctx()
