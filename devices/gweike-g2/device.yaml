@@ -1,0 +1,32 @@
+api_version: 1
+device:
+  name: "Gweike G2"
+  vendor: "Gweike"
+  model: "G2"
+  description: "Gweike G2 fiber galvo laser (110×110mm field, BJJCZ LMC controller)"
+machine:
+  driver: BJJCZDriver
+  driver_args:
+    usb_vendor_id: 0x04b4
+    usb_product_id: 0x1004
+    read_endpoint: 0x84
+    galvos_per_mm: 500
+    field_size_mm: 110.0
+    source: fiber
+    flip_y: true
+  axis_extents: [110.0, 110.0]
+  origin: center
+  max_travel_speed: 15000
+  max_cut_speed: 5000
+  supports_arcs: false
+  supports_curves: false
+  heads:
+    - name: "Fiber Laser"
+      tool_number: 0
+      laser_type: fiber
+      spot_size_mm: [0.03, 0.03]
+      pwm_frequency: 20000
+      max_pwm_frequency: 100000
+      pulse_width: 200
+      min_pulse_width: 50
+      max_pulse_width: 500

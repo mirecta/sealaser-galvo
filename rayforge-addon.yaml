@@ -1,0 +1,16 @@
+name: "bjjcz"
+display_name: "BJJCZ / JCZ Galvo Laser"
+description: "Driver for BJJCZ LMC galvo fiber laser controllers (Gweike G2, etc.)"
+api_version: 15
+depends:
+  - rayforge>=0.27.0
+author:
+  name: "Miroslav Talasek"
+  email: "miroslav.talasek@gmail.com"
+license:
+  name: "MIT"
+provides:
+  backend: "bjjcz.backend"
+  assets:
+    - type: "device"
+      path: "./devices/"
