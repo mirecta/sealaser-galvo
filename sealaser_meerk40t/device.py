@@ -214,6 +214,23 @@ class SeaLaserDevice(Service):
     def supports_pwm(self):
         return False
 
+    def outline(self):
+        """
+        "Outline" toolbar button handler. Without this method, MeerK40t's
+        laserpanel.py falls back to "element* trace hull" (convex hull),
+        which hits an unrelated upstream bug in Geomstr.convex_hull's numpy
+        code for some point sets. "trace quick" (a plain bounding-box
+        outline, no convex hull math) avoids it entirely and is good enough
+        for a positioning preview.
+
+        NOTE: unlike balormk's outline() (which does a continuous red-dot
+        "full-light" trace of the actual shape via a dedicated LightJob),
+        this only traces the bounding box and doesn't move the laser at
+        all yet — we haven't wired up a red-dot preview job. Good enough
+        for now; revisit if a real light-trace is needed.
+        """
+        self("element* trace quick\n")
+
     def service_attach(self, *args, **kwargs):
         if hasattr(self.driver, "service_attach"):
             self.driver.service_attach()
