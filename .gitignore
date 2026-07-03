@@ -1,3 +1,4 @@
-bjjcz/__pycache__/
-tests/__pycache__/
-rayforge_addon_bjjcz.egg-info/
+__pycache__/
+*.egg-info/
+logs/
+.gconsole_history
