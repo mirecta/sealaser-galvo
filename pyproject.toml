@@ -1,7 +1,7 @@
 [project]
-name = "rayforge-addon-bjjcz"
+name = "sealaser-galvo"
 version = "0.1.0"
-description = "Rayforge addon: BJJCZ/JCZ LMC galvo laser driver (Gweike G2)"
+description = "Pure-USB protocol driver for BJJCZ/SEA-LASER galvo fiber laser controllers (Gweike G2)"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
