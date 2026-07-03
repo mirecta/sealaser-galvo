@@ -110,6 +110,7 @@ class SeaLaserController:
 
     def goto(self, x: float, y: float, long=None, short=None, distance_limit=None) -> None:
         with self._lock:
+            self.connect_if_needed()
             self.flush()
             x_mm, y_mm = self._native_to_mm(x, y)
             self._usb.goto_xy(x_mm, y_mm)
@@ -177,6 +178,7 @@ class SeaLaserController:
         with self._lock:
             if not self._pending_points:
                 return
+            self.connect_if_needed()
             points_mm = [self._native_to_mm(x, y) for x, y in self._pending_points]
             self._pending_points = []
             power = self._pending_power if self._pending_power is not None else self._power
