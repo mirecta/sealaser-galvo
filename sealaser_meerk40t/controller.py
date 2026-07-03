@@ -32,15 +32,35 @@ class SeaLaserController:
         self.service = service
         self._force_mock = force_mock
 
+        # service.lens_size is a Length string (e.g. "150mm"), not a plain
+        # float attribute — field_width_mm/field_height_mm never existed on
+        # the service, so this used to silently always fall back to the
+        # 150.0 default regardless of the configured Field size setting.
+        try:
+            from meerk40t.core.units import Length
+
+            field_mm = float(Length(getattr(service, "lens_size", "150mm")))
+        except Exception:
+            field_mm = 150.0
+
         self.config = GalvoConfig(
-            field_width_mm=float(getattr(service, "field_width_mm", 150.0)),
-            field_height_mm=float(getattr(service, "field_height_mm", 150.0)),
+            field_width_mm=field_mm,
+            field_height_mm=field_mm,
             scale_x=float(getattr(service, "scale_x", 1.0)),
             scale_y=float(getattr(service, "scale_y", 1.0)),
             jump_speed_mm_s=float(getattr(service, "default_jump_speed", 4000.0)),
             mark_speed_mm_s=float(getattr(service, "default_mark_speed", 500.0)),
             power_pct=float(getattr(service, "default_power", 30.0)),
             freq_khz=float(getattr(service, "default_frequency", 20.0)),
+            bulge_x=float(getattr(service, "bulge_x", 1.0)),
+            bulge_y=float(getattr(service, "bulge_y", 1.0)),
+            skew_x=float(getattr(service, "skew_x", 1.0)),
+            skew_y=float(getattr(service, "skew_y", 1.0)),
+            trapezoid_x=float(getattr(service, "trapezoid_x", 1.0)),
+            trapezoid_y=float(getattr(service, "trapezoid_y", 1.0)),
+            apply_distortion_correction=bool(
+                getattr(service, "apply_distortion_correction", False)
+            ),
         )
         self._usb = SEALaserUSB(config=self.config)
         self._lock = threading.RLock()
