@@ -287,8 +287,7 @@ class SEALaserUSB:
         dev.read(EP_RESP, 40, timeout=TIMEOUT_MS)
 
         self._seq += 1
-        x_g = self._mm_to_galvo_x(x_mm)
-        y_g = self._mm_to_galvo_y(y_mm)
+        x_g, y_g = self._mm_to_galvo(x_mm, y_mm)
         vspeed = self._vector_speed(x_g, y_g)
 
         frame = self._build_goto(self._seq, vspeed, self._mark_speed, x_g, y_g)
@@ -413,15 +412,15 @@ class SEALaserUSB:
             n_steps = max(1, round(dist_mm / self._interp_step_mm))
             for i in range(1, n_steps + 1):
                 t = i / n_steps
-                step_x_g = self._mm_to_galvo_x(cur_x_mm + (tx - cur_x_mm) * t)
-                step_y_g = self._mm_to_galvo_y(cur_y_mm + (ty - cur_y_mm) * t)
+                step_x_g, step_y_g = self._mm_to_galvo(
+                    cur_x_mm + (tx - cur_x_mm) * t, cur_y_mm + (ty - cur_y_mm) * t
+                )
                 mark_records += self._build_compact_record(
                     b"\x02\x45", int(mark_speed_mm_s), 0, step_x_g, step_y_g,
                 )
             cur_x_mm, cur_y_mm = tx, ty
 
-        final_x_g = self._mm_to_galvo_x(points[-1][0])
-        final_y_g = self._mm_to_galvo_y(points[-1][1])
+        final_x_g, final_y_g = self._mm_to_galvo(*points[-1])
 
         # 4) first write: lead goto record + param block + as many mark
         # records as fit under _MAX_FRAME_BODY (aligned to 18-byte records)
@@ -480,6 +479,11 @@ class SEALaserUSB:
         if self._dev is None:
             raise RuntimeError("Not connected — call connect() first")
         return self._dev
+
+    def _mm_to_galvo(self, x_mm: float, y_mm: float) -> tuple[int, int]:
+        """Apply distortion correction (if enabled) then convert to galvo units."""
+        x_mm, y_mm = self.config.correct(x_mm, y_mm)
+        return self._mm_to_galvo_x(x_mm), self._mm_to_galvo_y(y_mm)
 
     def _mm_to_galvo_x(self, mm: float) -> int:
         val = GALVO_CENTER + round(mm * self._galvos_per_mm_x)
