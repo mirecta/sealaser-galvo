@@ -19,13 +19,19 @@ dev = [
     "pytest-asyncio",
     "pytest-mock",
 ]
+meerk40t = [
+    "meerk40t",
+]
+
+[project.entry-points."meerk40t.extension"]
+sealaser = "sealaser_meerk40t.plugin:plugin"
 
 [build-system]
 requires = ["setuptools>=40.9.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["bjjcz*"]
+include = ["bjjcz*", "sealaser_meerk40t*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
